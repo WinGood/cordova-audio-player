@@ -12,7 +12,7 @@
     <asset src="www/RCPlayer.js" target="js/RCPlayer.js"/>
 
     <js-module src="www/RCPlayer.js" name="RCPlayer">
-        <clobbers target="RCPlayer"/>
+        <clobbers target="RCPlayer" />
     </js-module>
 
     <!-- android -->
@@ -26,6 +26,7 @@
         <source-file src="src/android/RCPlayer.java" target-dir="src/com/wingood/cordova/rcplayer/"/>
     </platform>
 
+    <!-- iOS -->
     <platform name="ios">
         <config-file target="config.xml" parent="/widget">
             <feature name="RCPlayer">
