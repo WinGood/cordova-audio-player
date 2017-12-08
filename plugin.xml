@@ -15,8 +15,18 @@
         <clobbers target="RCPlayer"/>
     </js-module>
 
-    <platform name="ios">
+    <!-- android -->
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="RCPlayer">
+                <param name="android-package" value="com.wingood.cordova.rcplayer.RCPlayer"/>
+            </feature>
+        </config-file>
 
+        <source-file src="src/android/RCPlayer.java" target-dir="src/com/wingood/cordova/rcplayer/"/>
+    </platform>
+
+    <platform name="ios">
         <config-file target="config.xml" parent="/widget">
             <feature name="RCPlayer">
                 <param name="ios-package" value="RCPlayer"/>
