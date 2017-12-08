@@ -10,11 +10,18 @@ static NSString *_cover;
 static NSNumber *_isLoop;
 static bool audioListenersApplied = false;
 static bool songIsLoaded = false;
+static bool songIsStopped = false;
+
+static bool readyToPlay = false;
+static bool readyToPlayFired = false;
+static AVURLAsset *readyToPlayAsset;
+static bool needPlaySong = false;
+static bool passOneUpdateTick = false;
 
 - (void)pluginInitialize
 {
     // Playback audio in background mode
-    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    audioSession = [AVAudioSession sharedInstance];
     BOOL ok;
     NSError *setCategoryError = nil;
     ok = [audioSession setCategory:AVAudioSessionCategoryPlayback error:&setCategoryError];
@@ -41,6 +48,9 @@ static bool songIsLoaded = false;
 
 - (void)initSong:(CDVInvokedUrlCommand*)command
 {
+    // remove current audio if it's exist
+    [self stop:nil];
+    
     initCallbackID = command.callbackId;
     center = [MPNowPlayingInfoCenter defaultCenter];
     NSDictionary *initSongDict = [command.arguments objectAtIndex:0];
@@ -61,57 +71,67 @@ static bool songIsLoaded = false;
 //    return;
 
     // Data from JS env
-    NSString *url = initSongDict[@"url"];
-    NSString *artist = initSongDict[@"artist"];
-    NSString *title = initSongDict[@"title"];
-    NSString *album = initSongDict[@"album"];
-    NSString *cover = initSongDict[@"cover"];
+    _artist = initSongDict[@"artist"];
+    _title = initSongDict[@"title"];
+    _album = initSongDict[@"album"];
+    _cover = initSongDict[@"cover"];
 
-    NSURL *soundUrl = [[NSURL alloc] initWithString:url];
+    NSURL *soundUrl = [[NSURL alloc] initWithString:initSongDict[@"url"]];
     AVURLAsset* audioAsset = [AVURLAsset URLAssetWithURL:soundUrl options:nil];
 
-    _artist = artist;
-    _title = title;
-    _album = album;
-    _cover = cover;
-    _isLoop = [NSNumber numberWithInteger:0];
-
     songIsLoaded = false;
-
-    [self unregisterAudioListeners];
-
-    self.audioItem = [AVPlayerItem playerItemWithAsset:audioAsset];
-    self.audioPlayer = [[AVPlayer alloc] initWithPlayerItem:self.audioItem];
-    self.audioPlayer.allowsExternalPlayback = false;
-
-    if (SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"10.0")) {
-        self.audioPlayer.automaticallyWaitsToMinimizeStalling = false;
-    }
-
-    [self sendDuration];
-    [self sendDataToJS:@{@"loop": _isLoop}];
-
-
-    [self registerAudioListeners];
-
-    NSLog(@"Song title %@", title);
+    readyToPlay = false;
+    readyToPlayFired = false;
+    needPlaySong = false;
+    songIsStopped = false;
+    passOneUpdateTick = false;
+    
+    
+    [audioAsset loadValuesAsynchronouslyForKeys:@[@"duration"] completionHandler:^{
+        [self unregisterAudioListeners];
+        
+        self.audioItem = [AVPlayerItem playerItemWithAsset:audioAsset];
+        self.audioPlayer = [[AVPlayer alloc] initWithPlayerItem:self.audioItem];
+        self.audioPlayer.allowsExternalPlayback = false;
+        
+        if (SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"10.0")) {
+            self.audioPlayer.automaticallyWaitsToMinimizeStalling = false;
+        }
+        
+        [self sendDuration];
+        [self registerAudioListeners];
+        
+        NSLog(@"Song title %@", _title);
+    }];
 }
 
 - (void) setCurrentTimeFromJS: (CDVInvokedUrlCommand*) command {
     NSNumber *value = [command.arguments objectAtIndex:0];
     NSLog(@"setCurrentTimeFromJS, %@", value);
-    [self setCurrentTime:[value floatValue]];
+    [self setCurrentTime:[value intValue]];
 }
 
 - (void) setLoopFromJS: (CDVInvokedUrlCommand*) command {
     _isLoop = [command.arguments objectAtIndex:0];
+    NSLog(@"%@", _isLoop);
     [self sendDataToJS:@{@"loop": _isLoop}];
 }
 
-- (void) setCurrentTime: (float) seconds {
+- (void) setCurrentTime: (int) seconds {
     // seek time in player
+    NSLog(@"seek time %d", seconds);
     CMTime seekTime = CMTimeMakeWithSeconds(seconds, 100000);
+    int audioCurrentTimeSeconds = CMTimeGetSeconds(seekTime);
+    NSString *currentTime = [[NSNumber numberWithInteger:audioCurrentTimeSeconds] stringValue];
+    passOneUpdateTick = true;
+    
+    [self sendDataToJS:@{@"currentTime": currentTime}];
     [self.audioPlayer seekToTime:seekTime];
+    
+    // update playnow widget
+    NSMutableDictionary *playInfo = [NSMutableDictionary dictionaryWithDictionary:[MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo];
+    [playInfo setObject:currentTime forKey:MPNowPlayingInfoPropertyElapsedPlaybackTime];
+    center.nowPlayingInfo = playInfo;
 }
 
 // Get id for JS callback
@@ -133,12 +153,8 @@ static bool songIsLoaded = false;
 - (void)sendDuration
 {
     CMTime audioDuration = self.audioPlayer.currentItem.asset.duration;
-    float audioDurationSeconds = CMTimeGetSeconds(audioDuration);
-    NSString *duration = [[NSNumber numberWithFloat:audioDurationSeconds] stringValue];
-//
-//    NSMutableDictionary *data = [NSMutableDictionary dictionary];
-//    [data setObject:[NSMutableDictionary dictionaryWithDictionary:@{@"duration" : duration}]
-//             forKey:@"data"];
+    int audioDurationSeconds = CMTimeGetSeconds(audioDuration);
+    NSString *duration = [[NSNumber numberWithInteger:audioDurationSeconds] stringValue];
 
     [self sendDataToJS:@{@"duration": duration}];
 
@@ -149,8 +165,8 @@ static bool songIsLoaded = false;
 {
     if (audioListenersApplied == true) {
         [self.audioItem removeObserver:self forKeyPath:@"loadedTimeRanges" context:nil];
+        [self.audioItem removeObserver:self forKeyPath:@"status"];
         [self.audioPlayer removeTimeObserver:self.timeObserver];
-        [self.audioPlayer removeObserver:self forKeyPath:@"status"];
         audioListenersApplied = false;
     }
 }
@@ -163,19 +179,23 @@ static bool songIsLoaded = false;
         CMTime interval = CMTimeMakeWithSeconds(1.0, NSEC_PER_SEC);
 
         self.timeObserver = [self.audioPlayer addPeriodicTimeObserverForInterval:interval queue:NULL usingBlock:^(CMTime time) {
-            CMTime audioCurrentTime = that.audioPlayer.currentTime;
-            float audioCurrentTimeSeconds = CMTimeGetSeconds(audioCurrentTime);
-            NSString *elapsed = [[NSNumber numberWithFloat:audioCurrentTimeSeconds] stringValue];
-
-            [that sendDataToJS:@{@"currentTime": elapsed}];
-            NSLog(@"update time - %@", elapsed);
+            if (passOneUpdateTick == true) {
+                passOneUpdateTick = false;
+            } else {
+                CMTime audioCurrentTime = that.audioPlayer.currentTime;
+                int audioCurrentTimeSeconds = CMTimeGetSeconds(audioCurrentTime);
+                NSString *elapsed = [[NSNumber numberWithInteger:audioCurrentTimeSeconds] stringValue];
+                
+                [that sendDataToJS:@{@"currentTime": elapsed}];
+                NSLog(@"update time - %@", elapsed);
+            }
         }];
 
         // Listener for buffering progress
         [self.audioItem addObserver:self forKeyPath:@"loadedTimeRanges" options:NSKeyValueObservingOptionNew context:nil];
 
         // Ready to play
-        [self.audioPlayer addObserver:self forKeyPath:@"status" options:0 context:nil];
+        [self.audioItem addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:nil];
 
         audioListenersApplied = true;
     }
@@ -183,9 +203,16 @@ static bool songIsLoaded = false;
 
 - (void)play:(CDVInvokedUrlCommand*)command
 {
-    NSLog(@"play, %@", _title);
-    [self.audioPlayer play];
-    [self updateMusicControls:false];
+    AVURLAsset *currentSong = (AVURLAsset *)[self.audioPlayer.currentItem asset];
+ 
+    // Songs are loading async, start playing only if song ready to play.
+    if ((readyToPlay == true) && ([currentSong.URL isEqual: readyToPlayAsset.URL])) {
+        NSLog(@"play, %@", _title);
+        [self.audioPlayer play];
+        [self updateMusicControls:false];
+    } else {
+        needPlaySong = true;
+    }
 }
 
 - (void)pause:(CDVInvokedUrlCommand*)command
@@ -193,13 +220,36 @@ static bool songIsLoaded = false;
     NSLog(@"pause");
     [self.audioPlayer pause];
     [self updateMusicControls:true];
+    [audioSession setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+}
+
+- (void)stop:(CDVInvokedUrlCommand*)command
+{
+    NSLog(@"stop");
+    
+    _isLoop = [NSNumber numberWithInteger:0];
+    
+    [self.audioPlayer pause];
+    [self.audioPlayer.currentItem cancelPendingSeeks];
+    [self.audioPlayer.currentItem.asset cancelLoading];
+    [self sendDataToJS:@{@"bufferProgress": @"0"}];
+    [self sendDataToJS:@{@"loop": _isLoop}];
+    [self unregisterAudioListeners];
+    
+    self.audioPlayer = nil;
+    self.audioItem = nil;
+    songIsStopped = true;
+    
+    center.nowPlayingInfo = nil;
 }
 
 - (void)sendRemoteControlEvent:(NSString*)event
 {
     NSLog(@"Event, %@", event);
     // Send event in JS env
-    [self sendDataToJS:@{@"event": event}];
+    if (songIsStopped == false) {
+     [self sendDataToJS:@{@"event": event}];
+    }
 }
 
 - (void)onPlay:(MPRemoteCommandHandlerStatus*)event { [self sendRemoteControlEvent:@"play"]; }
@@ -214,92 +264,100 @@ static bool songIsLoaded = false;
 
 - (MPRemoteCommandHandlerStatus)onChangePlayback:(MPChangePlaybackPositionCommandEvent*)event {
     NSLog(@"changePlaybackPosition to %f", event.positionTime);
-    CMTime seekTime = CMTimeMakeWithSeconds(event.positionTime, 100000);
-    float audioCurrentTimeSeconds = CMTimeGetSeconds(seekTime);
-    NSString *elapsed = [[NSNumber numberWithFloat:audioCurrentTimeSeconds] stringValue];
-
-    // seek to in player
-    [self setCurrentTime:audioCurrentTimeSeconds];
-
-    // update playnow widget
-    NSMutableDictionary *playInfo = [NSMutableDictionary dictionaryWithDictionary:[MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo];
-    [playInfo setObject:elapsed forKey:MPNowPlayingInfoPropertyElapsedPlaybackTime];
-    center.nowPlayingInfo = playInfo;
+    AVURLAsset *currentSong = (AVURLAsset *)[self.audioPlayer.currentItem asset];
+    
+    // Songs are loading async, rewind will work only for current song
+    if ((readyToPlay == true) && ([currentSong.URL isEqual: readyToPlayAsset.URL])) {
+        CMTime seekTime = CMTimeMakeWithSeconds(event.positionTime, 100000);
+        int audioCurrentTimeSeconds = CMTimeGetSeconds(seekTime);
+        NSString *elapsed = [[NSNumber numberWithInteger:audioCurrentTimeSeconds] stringValue];
+        
+        // seek to in player
+        [self setCurrentTime:audioCurrentTimeSeconds];
+        
+        // update playnow widget
+        NSMutableDictionary *playInfo = [NSMutableDictionary dictionaryWithDictionary:[MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo];
+        [playInfo setObject:elapsed forKey:MPNowPlayingInfoPropertyElapsedPlaybackTime];
+        center.nowPlayingInfo = playInfo;
+    }
 
     return MPRemoteCommandHandlerStatusSuccess;
 }
 
 - (void)updateMusicControls:(BOOL)isPause {
-    CMTime audioDuration = self.audioPlayer.currentItem.asset.duration;
-    CMTime audioCurrentTime = self.audioPlayer.currentTime;
-
-    float audioDurationSeconds = CMTimeGetSeconds(audioDuration);
-    float audioCurrentTimeSeconds = CMTimeGetSeconds(audioCurrentTime);
-
-    NSString *duration = [[NSNumber numberWithFloat:audioDurationSeconds] stringValue];
-    NSString *elapsed = [[NSNumber numberWithFloat:audioCurrentTimeSeconds] stringValue];
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        UIImage *image = nil;
-        // check whether cover path is present
-        if (![_cover isEqual: @""]) {
-            // cover is remote file
-            if ([_cover hasPrefix: @"http://"] || [_cover hasPrefix: @"https://"]) {
-                NSURL *imageURL = [NSURL URLWithString:_cover];
-                NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
-                image = [UIImage imageWithData:imageData];
-            }
-            // cover is full path to local file
-            else if ([_cover hasPrefix: @"file://"]) {
-                NSString *fullPath = [_cover stringByReplacingOccurrencesOfString:@"file://" withString:@""];
-                BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:fullPath];
-                if (fileExists) {
-                    image = [[UIImage alloc] initWithContentsOfFile:fullPath];
+    if (songIsStopped == false) {
+        CMTime audioDuration = self.audioPlayer.currentItem.asset.duration;
+        CMTime audioCurrentTime = self.audioPlayer.currentTime;
+        
+        int audioDurationSeconds = CMTimeGetSeconds(audioDuration);
+        int audioCurrentTimeSeconds = CMTimeGetSeconds(audioCurrentTime);
+        
+        NSString *duration = [[NSNumber numberWithInteger:audioDurationSeconds] stringValue];
+        NSString *elapsed = [[NSNumber numberWithInteger:audioCurrentTimeSeconds] stringValue];
+        
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+            UIImage *image = nil;
+            // check whether cover path is present
+            if (![_cover isEqual: @""]) {
+                // cover is remote file
+                if ([_cover hasPrefix: @"http://"] || [_cover hasPrefix: @"https://"]) {
+                    NSURL *imageURL = [NSURL URLWithString:_cover];
+                    NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
+                    image = [UIImage imageWithData:imageData];
+                }
+                // cover is full path to local file
+                else if ([_cover hasPrefix: @"file://"]) {
+                    NSString *fullPath = [_cover stringByReplacingOccurrencesOfString:@"file://" withString:@""];
+                    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:fullPath];
+                    if (fileExists) {
+                        image = [[UIImage alloc] initWithContentsOfFile:fullPath];
+                    }
+                }
+                // cover is relative path to local file
+                else {
+                    NSString *basePath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) objectAtIndex:0];
+                    NSString *fullPath = [NSString stringWithFormat:@"%@%@", basePath, _cover];
+                    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:fullPath];
+                    if (fileExists) {
+                        image = [UIImage imageNamed:fullPath];
+                    }
                 }
             }
-            // cover is relative path to local file
             else {
-                NSString *basePath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) objectAtIndex:0];
-                NSString *fullPath = [NSString stringWithFormat:@"%@%@", basePath, _cover];
-                BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:fullPath];
-                if (fileExists) {
-                    image = [UIImage imageNamed:fullPath];
-                }
+                // default named "no-image"
+                image = [UIImage imageNamed:@"no-image"];
             }
-        }
-        else {
-            // default named "no-image"
-            image = [UIImage imageNamed:@"no-image"];
-        }
-
-        // check whether image is loaded
-        CGImageRef cgref = [image CGImage];
-        CIImage *cim = [image CIImage];
-        if (cim != nil || cgref != NULL) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (NSClassFromString(@"MPNowPlayingInfoCenter")) {
-                    MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithImage: image];
-                    center.nowPlayingInfo = [NSDictionary dictionaryWithObjectsAndKeys:
-                                             _artist, MPMediaItemPropertyArtist,
-                                             _title, MPMediaItemPropertyTitle,
-                                             _album, MPMediaItemPropertyAlbumTitle,
-                                             artwork, MPMediaItemPropertyArtwork,
-                                             duration, MPMediaItemPropertyPlaybackDuration,
-                                             elapsed, MPNowPlayingInfoPropertyElapsedPlaybackTime,
-                                             [NSNumber numberWithFloat:(isPause ? 0.0f : 1.0f)], MPNowPlayingInfoPropertyPlaybackRate, nil];
-                }
-            });
-        }
-    });
+            
+            // check whether image is loaded
+            CGImageRef cgref = [image CGImage];
+            CIImage *cim = [image CIImage];
+            if (cim != nil || cgref != NULL) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (NSClassFromString(@"MPNowPlayingInfoCenter")) {
+                        MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithImage: image];
+                        center.nowPlayingInfo = [NSDictionary dictionaryWithObjectsAndKeys:
+                                                 _artist, MPMediaItemPropertyArtist,
+                                                 _title, MPMediaItemPropertyTitle,
+                                                 _album, MPMediaItemPropertyAlbumTitle,
+                                                 artwork, MPMediaItemPropertyArtwork,
+                                                 duration, MPMediaItemPropertyPlaybackDuration,
+                                                 elapsed, MPNowPlayingInfoPropertyElapsedPlaybackTime,
+                                                 [NSNumber numberWithFloat:(isPause ? 0.0f : 1.0f)], MPNowPlayingInfoPropertyPlaybackRate, nil];
+                    }
+                });
+            }
+        });
+    }
 }
 
 -(void)itemDidFinishPlaying:(NSNotification *) notification {
     NSLog(@"Song stopped, %@", _isLoop);
     // If need loop current song
     if ([_isLoop isEqualToNumber:[NSNumber numberWithInt:1]]) {
-        [self setCurrentTime:0.0];
+        [self setCurrentTime:0];
         [self play:nil];
     } else {
+        [self sendDataToJS:@{@"currentTime": @"0"}];
         [self sendRemoteControlEvent:@"nextTrack"];
     }
 }
@@ -307,9 +365,20 @@ static bool songIsLoaded = false;
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                         change:(NSDictionary *)change context:(void *)context {
     // check status initializing of song
-    if (object == self.audioPlayer && [keyPath isEqualToString:@"status"]) {
-        if (self.audioPlayer.status == AVPlayerStatusReadyToPlay) {
+    if (object == self.audioItem && [keyPath isEqualToString:@"status"]) {
+        if (self.audioItem.status == AVPlayerStatusReadyToPlay) {
             NSLog(@"Ready to play");
+            
+            if (readyToPlayFired == false) {
+                readyToPlay = true;
+                readyToPlayFired = true;
+                readyToPlayAsset = (AVURLAsset *)[self.audioPlayer.currentItem asset];
+                
+                if (needPlaySong) {
+                    [self play:nil];
+                }
+            }
+            
             plresult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:nil];
             [self.commandDelegate sendPluginResult:plresult callbackId:initCallbackID];
         } else if (self.audioPlayer.status == AVPlayerStatusFailed) {
@@ -326,8 +395,8 @@ static bool songIsLoaded = false;
             CMTimeRange timeRange = [[loadedTimeRanges objectAtIndex:0] CMTimeRangeValue];
             Float64 startSeconds = CMTimeGetSeconds(timeRange.start);
             Float64 durationSeconds = CMTimeGetSeconds(timeRange.duration);
-
-            float percent = (startSeconds + durationSeconds) * 100 / CMTimeGetSeconds(self.audioPlayer.currentItem.duration);
+            
+            float percent = (startSeconds + durationSeconds) / CMTimeGetSeconds(self.audioPlayer.currentItem.duration) * 100;
 
             NSString *percentString = [[NSNumber numberWithFloat:percent] stringValue];
 
